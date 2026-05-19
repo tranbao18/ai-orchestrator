@@ -35,3 +35,4 @@ jobs:
         context: ./ai-orchestrator
         push: true
         tags: ghcr.io/${{ github.repository }}/ai-orchestrator:latest
+        # Kick hoat lai luong CI/C
