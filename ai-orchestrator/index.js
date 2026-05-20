@@ -6,6 +6,23 @@ const { OpenAI } = require('openai');
 const Anthropic = require('@anthropic-ai/sdk');
 const Parser = require('rss-parser');
 const rssParser = new Parser();
+const mongoose = require('mongoose');
+
+// 1. Kết nối với MongoDB Atlas
+mongoose.connect(process.env.MONGODB_URI)
+    .then(() => console.log('✅ Đã kết nối thành công với MongoDB Atlas!'))
+    .catch(err => console.error('❌ Lỗi kết nối MongoDB:', err));
+
+// 2. Thiết kế bộ khung (Schema) để lưu tin nhắn
+const messageSchema = new mongoose.Schema({
+    chatId: String, // ID của người chat trên Telegram
+    role: String,   // 'user' (người dùng) hoặc 'assistant' (bot AI)
+    content: String, // Nội dung tin nhắn
+    timestamp: { type: Date, default: Date.now } // Thời gian nhắn
+});
+
+// Tạo Model từ Schema
+const Message = mongoose.model('Message', messageSchema);
 
 const app = express();
 app.use(express.json());
@@ -58,12 +75,12 @@ const tools = [{
     ]
 }];
 
-// --- ADAPTER CHO ROUTER (GPT & Claude) ---
-async function callGPT(prompt) {
+// --- ADAPTER CHO ROUTER (GPT & Claude) - Nâng cấp nhận Mảng thay vì Chuỗi ---
+async function callGPT(messages) {
     try {
         const response = await openai.chat.completions.create({
             model: "gpt-4o",
-            messages: [{ role: "user", content: prompt }],
+            messages: messages, // Truyền nguyên mảng lịch sử vào
         });
         return response.choices[0].message.content;
     } catch (error) {
@@ -72,21 +89,23 @@ async function callGPT(prompt) {
     }
 }
 
-async function callClaude(prompt) {
+async function callClaude(messages) {
     try {
+        // Lọc bỏ những tin nhắn lỗi có role không hợp lệ (nếu có) để tránh Claude báo lỗi
+        const validMessages = messages.filter(msg => msg.role === 'user' || msg.role === 'assistant');
         const response = await anthropic.messages.create({
             model: "claude-3-5-sonnet-20241022",
             max_tokens: 1024,
-            messages: [{ role: "user", content: prompt }],
+            messages: validMessages, // Truyền nguyên mảng lịch sử vào
         });
         return response.content[0].text;
     } catch (error) {
         console.error("Lỗi Claude:", error.message);
-        return "Xin lỗi, Claude 3.5 đang gặp sự cố. Vui lòng kiểm tra lại số dư tài khoản API.";
+        return "Xin lỗi, Claude 3.5 đang gặp sự cố. Vui lòng kiểm tra lại API key hoặc số dư.";
     }
 }
 
-// --- WEBHOOK ENDPOINT (Cơ chế chống nghẽn 2 luồng) ---
+// --- WEBHOOK ENDPOINT ---
 app.post('/webhook/telegram', (req, res) => {
     // 1. Lập tức trả về 200 OK để chống nghẽn Telegram
     res.sendStatus(200);
@@ -107,30 +126,65 @@ app.post('/webhook/telegram', (req, res) => {
 
             let aiResponse = "";
             let cleanText = userText.trim();
+            let currentModel = 'gemini'; // Mặc định là Gemini
+            let actualMessage = cleanText;
 
-            // --- ROUTER LOGIC ---
+            // --- KIỂM TRA ĐỊNH TUYẾN ---
             if (cleanText.toLowerCase().startsWith("/gpt ")) {
+                currentModel = 'gpt';
+                actualMessage = cleanText.substring(5).trim();
                 console.log("🔀 Định tuyến sang: GPT-4o");
-                const prompt = cleanText.substring(5).trim();
-                aiResponse = await callGPT(prompt);
-
             } else if (cleanText.toLowerCase().startsWith("/claude ")) {
+                currentModel = 'claude';
+                actualMessage = cleanText.substring(8).trim();
                 console.log("🔀 Định tuyến sang: Claude 3.5 Sonnet");
-                const prompt = cleanText.substring(8).trim();
-                aiResponse = await callClaude(prompt);
-
             } else {
                 console.log("🔀 Định tuyến sang: Gemini (Kèm Tool Calling)");
-                // Sửa lỗi: Khởi tạo biến model của Gemini ngay tại đây
+            }
+
+            // --- BƯỚC A: LƯU TIN NHẮN MỚI CỦA USER VÀO DATABASE ---
+            await Message.create({ chatId: chatId.toString(), role: 'user', content: actualMessage });
+
+            // --- BƯỚC B: LẤY LỊCH SỬ CHAT TỪ DATABASE ---
+            const rawHistory = await Message.find({ chatId: chatId.toString() })
+                .sort({ timestamp: -1 })
+                .limit(10); // Lấy 10 tin nhắn gần nhất
+
+            rawHistory.reverse(); // Đảo ngược mảng để sắp xếp từ cũ -> mới
+
+            // --- BƯỚC C: XỬ LÝ THEO TỪNG MODEL ---
+            if (currentModel === 'gpt') {
+                const aiContextMessages = rawHistory.map(msg => ({
+                    role: msg.role,
+                    content: msg.content
+                }));
+                aiResponse = await callGPT(aiContextMessages);
+
+            } else if (currentModel === 'claude') {
+                const aiContextMessages = rawHistory.map(msg => ({
+                    role: msg.role,
+                    content: msg.content
+                }));
+                aiResponse = await callClaude(aiContextMessages);
+
+            } else {
+                // Logic cho Gemini (Cần map role assistant -> model)
+                // Cắt bỏ phần tử cuối cùng (là tin nhắn hiện tại) ra khỏi lịch sử cũ
+                const previousHistory = rawHistory.slice(0, -1).map(msg => ({
+                    role: msg.role === 'assistant' ? 'model' : 'user',
+                    parts: [{ text: msg.content }]
+                }));
+
                 const model = genAI.getGenerativeModel({
                     model: "gemini-2.5-flash",
                     tools: tools
                 });
 
-                const chat = model.startChat();
-                let result = await chat.sendMessage(cleanText);
+                const chat = model.startChat({ history: previousHistory });
+                let result = await chat.sendMessage(actualMessage);
                 aiResponse = result.response.text();
 
+                // Xử lý Tool Calling (Nếu có)
                 const call = result.response.functionCalls();
                 if (call && call.length > 0) {
                     const functionName = call[0].name;
@@ -150,7 +204,10 @@ app.post('/webhook/telegram', (req, res) => {
                 }
             }
 
-            // Gửi tin nhắn trả về Telegram
+            // --- BƯỚC D: LƯU CÂU TRẢ LỜI CỦA BOT VÀO DATABASE ---
+            await Message.create({ chatId: chatId.toString(), role: 'assistant', content: aiResponse });
+
+            // --- BƯỚC E: GỬI KẾT QUẢ VỀ TELEGRAM ---
             await axios.post(`${TELEGRAM_API}/sendMessage`, {
                 chat_id: chatId,
                 text: aiResponse
