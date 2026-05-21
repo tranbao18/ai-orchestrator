@@ -105,6 +105,8 @@ async function callClaude(messages) {
     }
 }
 
+const ALLOWED_USERS = process.env.ALLOWED_CHAT_IDS ? process.env.ALLOWED_CHAT_IDS.split(',') : [];
+
 // --- WEBHOOK ENDPOINT ---
 app.post('/webhook/telegram', (req, res) => {
     // 1. Lập tức trả về 200 OK để chống nghẽn Telegram
@@ -113,8 +115,18 @@ app.post('/webhook/telegram', (req, res) => {
     const message = req.body.message;
     if (!message || !message.text) return;
 
-    const chatId = message.chat.id;
+    const chatId = message.chat.id.toString();
     const userText = message.text;
+
+    if (!ALLOWED_USERS.includes(chatId)) {
+        console.log(`⚠️ Cảnh báo: Truy cập trái phép từ Chat ID: ${chatId}`);
+        // Có thể gửi tin nhắn từ chối (hoặc im lặng block luôn để tiết kiệm tài nguyên)
+        axios.post(`${TELEGRAM_API}/sendMessage`, {
+            chat_id: chatId,
+            text: "⛔ Xin lỗi, bạn không có quyền truy cập vào hệ thống AI này."
+        }).catch(err => console.error(err));
+        return; // Dừng tiến trình ngay lập tức, KHÔNG cho code chạy xuống phần gọi AI
+    }
 
     // 2. Mở luồng phụ (ngầm) xử lý AI
     (async () => {
